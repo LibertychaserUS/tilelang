@@ -633,6 +633,12 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
      * Has one IntSet for each index in the buffer being accessed.
      */
     Array<arith::IntSet> touched;
+    /*!
+     * \brief Thread constraints of the partial barriers this access already
+     * went through. A later access is ordered after it only if its threads all
+     * satisfy one of them.
+     */
+    std::vector<PrimExpr> retired_by;
     /*! \brief The type of access */
     AccessType type;
     /*! \brief The storage scope */
@@ -1396,8 +1402,8 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
             break;
           }
         } else if (acc.type == kSync) {
-          reads.clear();
-          writes.clear();
+          RetireAccessesBySync(&reads, acc);
+          RetireAccessesBySync(&writes, acc);
         }
       }
       // If sync is inserted. remove the irrelevant things.
@@ -1412,8 +1418,8 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
         } else if (acc.type == kWrite) {
           writes.push_back(acc);
         } else if (acc.type == kSync) {
-          reads.clear();
-          writes.clear();
+          RetireAccessesBySync(&reads, acc);
+          RetireAccessesBySync(&writes, acc);
         }
       }
 
@@ -1476,8 +1482,8 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
               break;
             }
           } else if (acc.type == kSync) {
-            reads.clear();
-            writes.clear();
+            RetireAccessesBySync(&reads, acc);
+            RetireAccessesBySync(&writes, acc);
           }
         }
         if (need_loop_sync) {
@@ -1515,10 +1521,12 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
       }
       for (const AccessEntry &acc : s.access) {
         if (acc.type == kSync) {
+          // Keep the barrier's own participants: a barrier inside a
+          // thread-dependent branch must not retire other threads' accesses.
           if (sync_count != 0) {
-            tail.clear();
+            RetireAccessesBySync(&tail, acc);
           } else {
-            head.push_back(esync);
+            head.push_back(acc);
           }
           ++sync_count;
         } else {
@@ -1737,6 +1745,60 @@ private:
     LOG(WARNING) << output.str();
   }
   /*!
+   * \brief Drop the pending accesses that barrier \p sync orders.
+   *
+   * A barrier inside a thread-dependent branch (e.g. one warpgroup of a
+   * warp-specialized kernel) is reached only by the threads satisfying the
+   * branch condition. It orders an earlier access only against later accesses
+   * by those same threads, so the access stays pending and records the
+   * barrier's participants (see FindConflict). Only the thread-dependent part
+   * of the barrier's constraint is compared, so barriers that every thread
+   * reaches still clear everything.
+   */
+  void RetireAccessesBySync(std::vector<AccessEntry> *pending,
+                            const AccessEntry &sync) {
+    std::unordered_set<const VarNode *> thread_vars;
+    for (const IterVar &iv : sync.threads) {
+      thread_vars.insert(iv->var.get());
+    }
+    std::vector<PrimExpr> participants;
+    std::vector<PrimExpr> stack{sync.cset.ToConjunction()};
+    while (!stack.empty()) {
+      PrimExpr conjunct = stack.back();
+      stack.pop_back();
+      if (const auto *and_node = conjunct.as<AndNode>()) {
+        stack.push_back(and_node->a);
+        stack.push_back(and_node->b);
+      } else if (UsesVar(conjunct, [&](const VarNode *v) {
+                   return thread_vars.count(v) != 0;
+                 })) {
+        participants.push_back(conjunct);
+      }
+    }
+    if (participants.empty()) {
+      pending->clear();
+      return;
+    }
+    PrimExpr sync_constr = participants[0];
+    for (size_t i = 1; i < participants.size(); ++i) {
+      sync_constr = tirx::And(sync_constr, participants[i]);
+    }
+    for (AccessEntry &prev : *pending) {
+      arith::Analyzer analyzer;
+      for (const auto &iv : prev.threads) {
+        if (iv->dom.defined()) {
+          analyzer.Bind(iv->var, iv->dom);
+        }
+      }
+      // Only the threads performing `prev` are ordered before the barrier.
+      if (analyzer.z3_prover.CanProve(
+              tirx::Or(tirx::Not(prev.cset.ToConjunction()), sync_constr))) {
+        prev.retired_by.push_back(sync_constr);
+      }
+    }
+  }
+
+  /*!
    * \brief Check if two access entries conflict, considering loop-carried
    * dependencies.
    *
@@ -1774,6 +1836,24 @@ private:
     // program behavior (e.g., atomics with return values).
     if (prev.is_atomic && curr.is_atomic) {
       return false;
+    }
+
+    // A partial barrier between the two accesses orders them when every thread
+    // performing `curr` participates in it.
+    if (!prev.retired_by.empty()) {
+      arith::Analyzer analyzer;
+      for (const auto &iv : curr.threads) {
+        if (iv->dom.defined()) {
+          analyzer.Bind(iv->var, iv->dom);
+        }
+      }
+      PrimExpr curr_constr = curr.cset.ToConjunction();
+      for (const PrimExpr &participants : prev.retired_by) {
+        if (analyzer.z3_prover.CanProve(
+                tirx::Or(tirx::Not(curr_constr), participants))) {
+          return false;
+        }
+      }
     }
 
     if (prev.buffer_indices.size() != curr.buffer_indices.size()) {

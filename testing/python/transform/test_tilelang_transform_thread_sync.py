@@ -1867,5 +1867,56 @@ def test_partial_sync_multidimensional_rectangle():
     assert barriers[0][1] == 64
 
 
+def _loop_body_starts_with_barrier(func):
+    mod = run_passes(func)
+    loops = collect_nodes(_device_func(mod), tirx.For)
+    assert len(loops) == 1
+    body = loops[0].body
+    first = body.seq[0] if isinstance(body, tirx.SeqStmt) else body
+    return isinstance(first, tirx.Evaluate) and bool(collect_calls(first, op="tirx.tvm_storage_sync"))
+
+
+def test_partial_sync_in_branch_does_not_retire_other_threads_reads():
+    # A barrier inside the tx >= 128 branch is reached only by that warpgroup. It must not
+    # make the loop-carried hazard on A (read by this branch, rewritten by every thread in the
+    # next iteration) look resolved, so the loop body still needs its own barrier.
+    @T.prim_func(private=True)
+    def func(out: T.Buffer((256,), "float32")):
+        bx = T.launch_thread("blockIdx.x", 1)
+        tx = T.launch_thread("threadIdx.x", 256)
+        ty = T.launch_thread("threadIdx.y", 1)
+        tz = T.launch_thread("threadIdx.z", 1)
+        A = T.alloc_buffer((256,), "float32", scope="shared")
+        B = T.alloc_buffer((128,), "float32", scope="shared")
+        for ko in range(2):
+            A[tx] = T.float32(1)
+            if tx >= 128:
+                B[tx - 128] = T.float32(2)
+                out[tx] = A[(tx + 1) % 256]
+                out[tx] = out[tx] + B[(tx + 1) % 128]
+
+    assert _loop_body_starts_with_barrier(func)
+
+
+def test_partial_sync_in_branch_still_retires_same_branch_accesses():
+    # Everything in the loop happens inside one warpgroup branch, so its own barriers do order
+    # the accesses and no extra barrier is needed at the loop head.
+    @T.prim_func(private=True)
+    def func(out: T.Buffer((256,), "float32")):
+        bx = T.launch_thread("blockIdx.x", 1)
+        tx = T.launch_thread("threadIdx.x", 256)
+        ty = T.launch_thread("threadIdx.y", 1)
+        tz = T.launch_thread("threadIdx.z", 1)
+        A = T.alloc_buffer((256,), "float32", scope="shared")
+        for ko in range(2):
+            if tx >= 128:
+                A[tx] = T.float32(1)
+                T.evaluate(T.tvm_storage_sync("shared"))
+                out[tx] = A[(tx + 1) % 256]
+                T.evaluate(T.tvm_storage_sync("shared"))
+
+    assert not _loop_body_starts_with_barrier(func)
+
+
 if __name__ == "__main__":
     tilelang.testing.main()
