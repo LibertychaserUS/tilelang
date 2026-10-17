@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -51,6 +52,10 @@ namespace software_pipeline {
 using namespace tirx;
 using namespace ffi;
 using tirx::GetSBlockReadWriteRegion;
+
+// Tag on an async wait's in-flight count marking a wait that must stay at its
+// computed value: its consumer needs the group committed right before it.
+constexpr const char *kTightAsyncWait = "tl.tight_async_wait";
 
 using BufferSet = std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>;
 using VarSet = std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>;
@@ -1574,6 +1579,9 @@ private:
     struct PendingWait {
       int insert_before{-1};
       PrimExpr wait_count{nullptr};
+      // The wait covers the group committed last, for a consumer of the same
+      // iteration: no later loop relaxation may leave that group in flight.
+      bool tight{false};
 
       bool valid() const { return wait_count.defined(); }
     };
@@ -2266,6 +2274,19 @@ private:
     return FirstStaticWaitInWrapperRewriter::Rewrite(this, stmt, new_wait_n);
   }
 
+  static bool IsTightAsyncWait(const Stmt &stmt) {
+    bool tight = false;
+    PostOrderVisit(stmt, [&](const ObjectRef &obj) {
+      const auto *attr = obj.as<AttrStmtNode>();
+      if (attr && IsAsyncWaitInflightCount(attr)) {
+        if (const auto *tag = attr->node.as<StringImmNode>()) {
+          tight = tight || tag->value == kTightAsyncWait;
+        }
+      }
+    });
+    return tight;
+  }
+
   Stmt MaybeRelaxLoopWaits(const For &loop, int pre_outstanding_lb) const {
     int retain = PipelinedRetainGroups(GetPipelineNumStages(loop.get()));
     if (retain <= 0 || !loop.defined()) {
@@ -2297,7 +2318,7 @@ private:
       }
       if (cls.kind == AsyncSyncStmtKind::kWaitStatic) {
         int effective_wait_n = cls.wait_n;
-        if (cls.wait_n == 0) {
+        if (cls.wait_n == 0 && !IsTightAsyncWait(body[i])) {
           int groups_after_wait_lb =
               GuaranteedNewGroupsBeforeNextWait(body, i + 1);
           int per_sync_groups = groups_since_wait_lb;
@@ -2547,12 +2568,16 @@ private:
 
     std::map<int, int> last_committed_group;
     auto record_pending_wait = [&](AsyncStateLocal *state, int commit_group_id,
-                                   int insert_before, PrimExpr wait_count) {
+                                   int insert_before, PrimExpr wait_count,
+                                   bool tight = false) {
       auto &pending_wait = state->pending_waits[commit_group_id];
       if (!pending_wait.valid()) {
-        pending_wait = {insert_before, wait_count};
+        pending_wait = {insert_before, wait_count, tight};
       } else if (analyzer_.CanProve(wait_count < pending_wait.wait_count)) {
-        pending_wait = {pending_wait.insert_before, wait_count};
+        pending_wait = {pending_wait.insert_before, wait_count, tight};
+      } else if (tight &&
+                 analyzer_.CanProve(wait_count == pending_wait.wait_count)) {
+        pending_wait.tight = true;
       }
     };
 
@@ -2689,8 +2714,15 @@ private:
           }
         }
 
+        // Producer and consumer are in the same iteration and the group is the
+        // last one committed, so nothing may stay in flight behind it.
+        bool tight = latest_producer_head &&
+                     commit_group_id == latest_group_id &&
+                     is_zero(wait_count) &&
+                     ana_normalized->CanProve(latest_producer_head.value() ==
+                                              new_stmts[i].access_index);
         record_pending_wait(&dep_local_state, commit_group_id,
-                            static_cast<int>(i), wait_count);
+                            static_cast<int>(i), wait_count, tight);
         need_wait_count[commit_group_id] = false;
       }
     }
@@ -2711,20 +2743,40 @@ private:
     std::unordered_map<int, int> commit_group_tag_to_stage;
     int next_commit_group_tag = 0;
     std::map<int, std::map<int, PrimExpr>> waits_before_stmt;
-    auto make_wait_stmt = [](int stage_id, PrimExpr wait_count, Stmt body) {
+    std::set<std::pair<int, int>> tight_waits;
+    auto make_wait_stmt = [](int stage_id, PrimExpr wait_count, Stmt body,
+                             bool tight) {
       auto zero = make_zero(DataType::Int(32));
+      ffi::Any count_node = zero;
+      if (tight) {
+        count_node = StringImm(kTightAsyncWait);
+      }
       return AttrStmt(zero, s_tir::attr::async_wait_queue_scope, stage_id,
-                      AttrStmt(zero, s_tir::attr::async_wait_inflight_count,
+                      AttrStmt(count_node,
+                               s_tir::attr::async_wait_inflight_count,
                                wait_count, body));
     };
     auto merge_wait_before_stmt = [&](int insert_before, int stage_id,
-                                      PrimExpr wait_count) {
+                                      PrimExpr wait_count, bool tight) {
       auto &waits_at_stmt = waits_before_stmt[insert_before];
       auto it = waits_at_stmt.find(stage_id);
+      auto key = std::make_pair(insert_before, stage_id);
       if (it == waits_at_stmt.end()) {
         waits_at_stmt.emplace(stage_id, ana_normalized->Simplify(wait_count));
+        if (tight) {
+          tight_waits.insert(key);
+        } else {
+          tight_waits.erase(key);
+        }
       } else if (ana_normalized->CanProve(wait_count < it->second)) {
         it->second = ana_normalized->Simplify(wait_count);
+        if (tight) {
+          tight_waits.insert(key);
+        } else {
+          tight_waits.erase(key);
+        }
+      } else if (tight && ana_normalized->CanProve(wait_count == it->second)) {
+        tight_waits.insert(key);
       }
     };
 
@@ -2753,12 +2805,12 @@ private:
             continue;
           }
           merge_wait_before_stmt(pending_wait.insert_before, stage_id,
-                                 wait_count);
+                                 wait_count, pending_wait.tight);
           continue;
         }
 
-        merge_wait_before_stmt(pending_wait.insert_before, stage_id,
-                               wait_count);
+        merge_wait_before_stmt(pending_wait.insert_before, stage_id, wait_count,
+                               pending_wait.tight);
       }
     }
 
@@ -2766,7 +2818,10 @@ private:
     for (size_t i = 0; i < new_stmts.size();) {
       if (auto it = waits_before_stmt.find(i); it != waits_before_stmt.end()) {
         for (const auto &[stage_id, wait_count] : it->second) {
-          Stmt wait_stmt = make_wait_stmt(stage_id, wait_count, Evaluate(0));
+          Stmt wait_stmt = make_wait_stmt(
+              stage_id, wait_count, Evaluate(0),
+              tight_waits.count(std::make_pair(static_cast<int>(i), stage_id)) >
+                  0);
           if (auto state_it = async_states_local.find(stage_id);
               state_it != async_states_local.end() &&
               state_it->second.predicate &&
