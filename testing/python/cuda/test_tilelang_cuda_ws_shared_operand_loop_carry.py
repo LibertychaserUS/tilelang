@@ -1,4 +1,3 @@
-import pytest
 import torch
 
 import tilelang
@@ -41,12 +40,12 @@ def _make_ws_gemm(K, num_stages):
     return main
 
 
-@pytest.mark.parametrize("K", [64, 128, 256])
 @tilelang.testing.requires_cuda_compute_version_eq(9, 0)
-def test_ws_gemm_shared_a_is_not_overwritten_while_other_warpgroup_reads(K):
+def test_ws_gemm_shared_a_is_not_overwritten_while_other_warpgroup_reads():
     # Both warpgroups read A_shared through WGMMA while every thread rewrites it in the next
     # K iteration. The barriers each warpgroup needs inside its own branch must not hide that
     # loop-carried write-after-read hazard (#2613).
+    K = 128  # two K tiles: the smallest size where A_shared is rewritten while still read
     kernel = tilelang.compile(_make_ws_gemm(K, num_stages=0), out_idx=[2], target="cuda")
     generator = torch.Generator(device="cuda").manual_seed(0)
     a = torch.randn(128, K, device="cuda", dtype=torch.float16, generator=generator)
