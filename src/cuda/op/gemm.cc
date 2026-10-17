@@ -96,6 +96,22 @@ bool AllowWgmma(const GemmNode &op, int block_size, Target target) {
          CheckWgmma(op);
 }
 
+// True when an fp8 Hopper GEMM would be eligible for WGMMA except that the
+// operands are not K-major, so instruction selection silently falls back to
+// mma.sync (the fp8 wgmma form has no transpose operands).
+bool Fp8WgmmaBlockedOnlyByLayout(const GemmNode &op, int block_size,
+                                 Target target) {
+  tvm::transform::PassContext ctxt = tvm::transform::PassContext::Current();
+  int num_warps = block_size / TargetCudaGetWarpSize(target);
+  bool c_ok = op.c_->dtype == DataType::Float(16) ||
+              op.c_->dtype == DataType::Float(32);
+  return !ctxt->GetConfig(kDisableWGMMA, Optional<Bool>()).value_or(false) &&
+         TargetIsHopper(target) && op.m_ >= 64 && num_warps % 4 == 0 &&
+         IsSharedBuffer(op.b_) && c_ok && op.a_->dtype.is_float8() &&
+         op.b_->dtype.is_float8() && op.k_ % 32 == 0 &&
+         (op.transA_ || !op.transB_);
+}
+
 bool AllowVoltaMma(const GemmNode &op) {
   bool scope_ok = (IsSharedBuffer(op.a_) || IsFragmentBuffer(op.a_)) &&
                   IsSharedBuffer(op.b_);
@@ -420,6 +436,15 @@ struct Gemm {
     }
     if (AllowWgmma(op, block_size, target)) {
       return kCudaWGMMA;
+    }
+    if (Fp8WgmmaBlockedOnlyByLayout(op, block_size, target)) {
+      LOG(WARNING) << "T.gemm with fp8 operands falls back from WGMMA to "
+                      "mma.sync on Hopper: fp8 WGMMA needs both operands "
+                      "K-major (transpose_A=False, transpose_B=True), got "
+                      "transpose_A="
+                   << op.transA_ << ", transpose_B=" << op.transB_
+                   << ". Store B as (N, K) and pass transpose_B=True to keep "
+                      "the WGMMA path.";
     }
     if (TargetIsVolta(target) && !AllowVoltaMma(op)) {
       return kCudaFMA;

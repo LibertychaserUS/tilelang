@@ -85,3 +85,37 @@ def test_gemm_mma_sync_supported_dtype_combo_runs(dtype, accum_dtype):
     out = kernel(a, b)
     ref = (a.float() @ b.float()).to(getattr(torch, accum_dtype))
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+def _make_fp8_gemm_kernel(b_k_major):
+    M = N = 128
+    K = 64
+    dtype = T.float8_e4m3fn
+    b_shape = (N, K) if b_k_major else (K, N)
+
+    @T.prim_func
+    def main(A: T.Tensor((M, K), dtype), B: T.Tensor(b_shape, dtype), C: T.Tensor((M, N), T.float16)):
+        with T.Kernel(1, 1, threads=128):
+            As = T.alloc_shared((M, K), dtype)
+            Bs = T.alloc_shared(b_shape, dtype)
+            Cl = T.alloc_fragment((M, N), T.float32)
+            T.clear(Cl)
+            T.copy(A, As)
+            T.copy(B, Bs)
+            T.gemm(As, Bs, Cl, transpose_B=b_k_major)
+            T.copy(Cl, C)
+
+    return main
+
+
+@pytest.mark.parametrize("b_k_major,expect_warning", [(False, True), (True, False)])
+@tilelang.testing.requires_cuda
+def test_gemm_fp8_hopper_warns_when_layout_forces_mma_sync(capfd, b_k_major, expect_warning):
+    # Regression for #3223: fp8 WGMMA needs K-major operands. A non-K-major B used
+    # to drop to mma.sync with no diagnostic; K-major must stay silent.
+    # Lower only (no nvcc, no kernel cache) so the warning fires on every run.
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_90a"})
+    with target:
+        tilelang.lower(_make_fp8_gemm_kernel(b_k_major), target=target)
+    err = capfd.readouterr().err
+    assert ("falls back from WGMMA to mma.sync" in err) == expect_warning
